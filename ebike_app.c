@@ -468,6 +468,31 @@ static void ebike_control_motor(void) // is called every 25ms by ebike_app_contr
     // speed limit :  reduce ui8_adc_battery_current_target progressively (up to 0) when close to speed limit (or exceed)
     apply_speed_limit();
 
+	// DEAD-SPOT BRIDGE: the pedal-torque delta momentarily drops to 0 at the dead-spots
+	// between power strokes. The SPIDER rotation-average that should smooth that gets disrupted by noisy
+	// PAS quadrature (the 20-sample/rotation buffer keeps getting reset/misaligned), so the raw
+	// per-stroke ripple - including its zeros - shows through, collapsing the assist target
+	// (~cadence*torque) to 0 and cutting the motor. Felt as kick-in/out per pedal stroke and a full
+	// cutout on light pedalling. Slew-limit how fast the target may FALL so a transient dead-spot can't
+	// zero it; it may still RISE instantly (stays responsive). Gated on PEDALLING (cadence>0) so it
+	// bridges dips at ANY speed while you pedal, and releases at once when you stop pedalling
+	// (coast/brake). (Previously gated to <18 km/h, which left at-speed dead-spots un-bridged.)
+	// Safety/brake stops below still force 0. DOWN_STEP tunable: lower = bridges longer dead-spots /
+	// more ease-off overrun; higher = snappier power-down but less bridging. The step is GENTLER at low
+	// speed (launch), where the cadence is low so the dead-spots are long (~0.5-0.6 s at ~20-25 rpm) and
+	// step 2 reaches 0 too fast (~0.375 s) -> the "hits 16 A then drops/cuts" on a from-0 boost launch.
+	#define DEADSPOT_BRIDGE_TARGET_DOWN_STEP   2   // normal (at speed): max target decrease / 25 ms tick
+	#define DEADSPOT_BRIDGE_LAUNCH_DOWN_STEP   1   // launch (low speed): gentler -> bridges long dead-spots
+	#define DEADSPOT_BRIDGE_LAUNCH_SPEED_X10   120 // < 12.0 km/h counts as launch
+	static uint8_t ui8_prev_adc_battery_current_target = 0;
+	uint8_t ui8_deadspot_bridge_step = (ui16_wheel_speed_x10 < DEADSPOT_BRIDGE_LAUNCH_SPEED_X10)
+			? DEADSPOT_BRIDGE_LAUNCH_DOWN_STEP : DEADSPOT_BRIDGE_TARGET_DOWN_STEP;
+	if ((ui8_pedal_cadence_RPM > 0)
+		&& (ui8_adc_battery_current_target + ui8_deadspot_bridge_step < ui8_prev_adc_battery_current_target)) {
+		ui8_adc_battery_current_target = ui8_prev_adc_battery_current_target - ui8_deadspot_bridge_step;
+	}
+	ui8_prev_adc_battery_current_target = ui8_adc_battery_current_target;
+
 	// used only in 860C version
 	// check if motor init delay has to be done (from v.1.1.0)
 	switch (ui8_m_motor_init_state)	{
