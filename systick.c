@@ -87,6 +87,15 @@ void SysTick_Handler(void) {
     // --- Wheel --- 
     static uint32_t ui32_prev_wheel_pwm_tick = 0;
     static uint32_t ui32_last_wheel_ms = 0;
+    static uint8_t  ui8_wheel_after_stop = 1; // 1 = next valid reading is the first since a stop
+    // Wheel-speed glitch reject. A spurious wheel-sensor pulse gives a short interval =
+    // bogus high speed; with the old "> 600 ticks (< 228 km/h)" gate a glitch to e.g. 188 km/h passed,
+    // stuck (no real pulse follows for a moment), and the firmware speed-limiter killed assist for ~1.5 s
+    // at a launch. Reject readings implausibly fast: faster than ~76 km/h ever, or faster than ~25 km/h
+    // on the FIRST reading right after a stop (the bike can't already be at speed). 600 ticks = 228 km/h
+    // (so ticks = 136800 / km/h). Real riding is well under these, so nothing legitimate is rejected.
+    #define WHEEL_GLITCH_MIN_TICKS   1800   // ~76 km/h: anything faster is a glitch
+    #define WHEEL_LAUNCH_MIN_TICKS   5500   // ~25 km/h: too fast for the FIRST reading after a stop
     // --- cadence --- 
     static int8_t i8_prev_cadence_index = -1;      // -1 = pas encore de référence
     static uint32_t ui32_prev_cadence_tick = 0;
@@ -177,13 +186,16 @@ void SysTick_Handler(void) {
         ui32_prev_wheel_pwm_tick = ui32_wheel_pwm_tick; // save for next comparison
         ui32_last_wheel_ms = ui32_ms_counter;           // used to detect when wheel stopped (time out)
         if (ui32_wheel_delta_ticks > 0) {
-            if (ui32_wheel_delta_ticks > 600) { // 600 at 19Khz => 2000mm/1000000(km) * 19000kHz/600 * 3600sec = 228 km/h
-                // set the value used in ebike_app.c to wheel speed when speed is not to high
+            // reject implausibly-fast glitches (see WHEEL_GLITCH_MIN_TICKS / WHEEL_LAUNCH_MIN_TICKS above)
+            uint8_t b_wheel_glitch = (ui32_wheel_delta_ticks < WHEEL_GLITCH_MIN_TICKS);
+            if (ui8_wheel_after_stop && (ui32_wheel_delta_ticks < WHEEL_LAUNCH_MIN_TICKS)) {
+                b_wheel_glitch = 1; // first reading right after a stop can't already be high speed
+            }
+            if (!b_wheel_glitch) {
                 ui16_wheel_speed_sensor_ticks = ui32_wheel_delta_ticks ; // ticks are based on PWM frequency
                 ++ui32_wheel_speed_sensor_ticks_total; // used only in 860C version to calculate the distance in 860c
-            } else {
-                // nothing :  discard the value and keep previous speed
-            }    
+                ui8_wheel_after_stop = 0; // first valid reading since the stop has been accepted
+            } // else: discard the value and keep previous speed
         }
     }
 
@@ -191,6 +203,7 @@ void SysTick_Handler(void) {
     if ((ui32_ms_counter - ui32_last_wheel_ms) > (WHEEL_SPEED_SENSOR_TICKS_COUNTER_MIN/19)) {
         ui16_wheel_speed_sensor_ticks = 0; // reset wheel speed
         ui32_prev_wheel_pwm_tick = 0;
+        ui8_wheel_after_stop = 1; // arm the launch glitch-guard for the next start
     }
 
     //      3)  get raw adc torque sensor (in 10 bits) and filter
