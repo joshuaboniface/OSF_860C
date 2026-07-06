@@ -1788,6 +1788,11 @@ void new_torque_sample() {
 //( (USE_SPIDER_LOGIC_FOR_TORQUE > 0 (so 1, 2, 3)
 #define TORQUE_SENSOR_ADC_REMAP_NORM_DIFF_MAX 100 // max value is 160
 #define AUTO_OFFSET_DEADBAND 12  // counts above the auto-measured resting ADC before torque registers (deadband)
+// Pre-move-kick gate (see the buffer-not-full branch below): ramp assist in over the first
+// LAUNCH_RAMP_SAMPLES PAS transitions (20 = 1 crank, so 6 = ~1/4-1/3 crank) but only below
+// LAUNCH_RAMP_MAX_SPEED_X10 (10.0 km/h = a genuine launch). Higher SAMPLES = gentler start.
+#define LAUNCH_RAMP_SAMPLES          5
+#define LAUNCH_RAMP_MAX_SPEED_X10    100
 static void get_pedal_torque(void) {
 	if (toffset_cycle_counter < TOFFSET_CYCLES) {  // less than 3 sec
 		ui16_adc_pedal_torque_offset_init = filter(ui16_adc_torque_filtered, ui16_adc_pedal_torque_offset_init , 4) ; // get filtered torque captured in motor.c irq1
@@ -1846,7 +1851,26 @@ static void get_pedal_torque(void) {
 		ui16_adc_pedal_torque_filtered_noExpo = filter( ui16_TorqueDeltaADC_norm , ui16_adc_pedal_torque_filtered_noExpo , 5); 
 		#else // (USE_SPIDER_LOGIC_FOR_TORQUE == (3) we use the average
 		if (ui8_TSamplesNum > 0 && ui16_TorqueDeltaADC_norm > 0) {
-			ui16_adc_pedal_torque_filtered_noExpo = ui16_TSum / ui8_TSamplesNum; // partial rotation: avg of 1-19 samples
+			// QUICK ENGAGEMENT: the cumulative average TSum/TSamplesNum averages in the
+			// early near-zero samples, so it lags the rising press and the motor engages only after ~a
+			// full crank. Track the LARGER of the partial average and the current sample so assist
+			// follows the press immediately (~1/4 crank). The dead-spot dips (norm==0 -> else branch)
+			// are bridged by the cadence-gated target slew.
+			uint16_t ui16_partial_avg = ui16_TSum / ui8_TSamplesNum;
+			uint16_t ui16_resp = (ui16_TorqueDeltaADC_norm > ui16_partial_avg)
+					? ui16_TorqueDeltaADC_norm : ui16_partial_avg;
+			// PRE-MOVE KICK GATE: ramp assist in over the first LAUNCH_RAMP_SAMPLES PAS
+			// transitions, but ONLY at low wheel speed (a genuine launch). This stops a rider standing on
+			// the pedal at a stop from getting a sudden, possibly dangerous power kick the instant the
+			// cranks break free. It is gated to low speed on purpose: gating this ramp-in EVERYWHERE
+			// previously regressed normal riding, because the SPIDER buffer resets constantly mid-ride on
+			// noisy PAS, so it fired on every reset. At launch the buffer fills from a true stop, so it
+			// ramps once; at mid-ride speed it is skipped entirely.
+			if ((ui16_wheel_speed_x10 < LAUNCH_RAMP_MAX_SPEED_X10)
+					&& (ui8_TSamplesNum < LAUNCH_RAMP_SAMPLES)) {
+				ui16_resp = (uint16_t)(((uint32_t)ui16_resp * ui8_TSamplesNum) / LAUNCH_RAMP_SAMPLES);
+			}
+			ui16_adc_pedal_torque_filtered_noExpo = ui16_resp;
 		} else {
 			// No samples yet, or no current torque (foot off pedal) — use filtered ADC.
 			// Decays to 0 when rider stops; responds instantly at standstill.
