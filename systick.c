@@ -97,7 +97,15 @@ void SysTick_Handler(void) {
     #define WHEEL_GLITCH_MIN_TICKS   1800   // ~76 km/h: anything faster is a glitch
     #define WHEEL_LAUNCH_MIN_TICKS   5500   // ~25 km/h: too fast for the FIRST reading after a stop
     // --- cadence --- 
+    // Consecutive reverse quadrature codes before believing a real backward rotation.
+    //   1 = upstream behaviour (zero cadence on ANY reverse) — CEDED to mstrens (his PAS is clean, so
+    //       lone reverse codes never occur and this whole path is a no-op anyway).
+    //   3 = debounce isolated detent-edge dither (a lone reverse = keep cadence). RESTORE this for a
+    //       worn/dirty PAS or torque sensor (the gremlin we saw with the old sensor). Kept in the code
+    //       on purpose — flip this one number to re-arm it.
+    #define CADENCE_REVERSE_DEBOUNCE 1   // was 3 (see above)
     static int8_t i8_prev_cadence_index = -1;      // -1 = pas encore de référence
+    static uint8_t ui8_cadence_reverse_cnt = 0;    // consecutive reverse quadrature codes (dither rejection)
     static uint32_t ui32_prev_cadence_tick = 0;
     static uint32_t ui32_last_cadence_ms = 0;
     static uint32_t ui32_prev_cadence_tick_max = 0;          // pour détecter un vrai nouveau front
@@ -133,11 +141,24 @@ void SysTick_Handler(void) {
     // Check if a new cadence event occured
     if (ui32_cadence_tick_max != ui32_prev_cadence_tick_max) {
         ui32_prev_cadence_tick_max = ui32_cadence_tick_max;
-        if (ui8_cadence_idx_max == 4) { // --- reverse cadence rotation ---
-            ui16_cadence_sensor_ticks = 0; // reset value used in ebike_app.c
-            i8_prev_cadence_index = -1;
-             ui8_pas_new_transition = 0x80; // used in mspider logic for torque sensor // to do
+        if (ui8_cadence_idx_max == 4) { // --- reverse transition seen ---
+            // DEBOUNCE spurious reverses: a single reverse quadrature code is almost
+            // always detent-edge dither, not real backward pedalling. The old code zeroed cadence AND
+            // wiped the SPIDER torque rotation-average buffer (pas_new_transition=0x80) on ONE reverse,
+            // so cadence glitched to 0 for ~300 ms while pedalling FORWARD at speed (ride12: 57 rpm /
+            // 12 km/h) and the torque buffer kept resetting -> the per-stroke dead-spot zeros and the
+            // long debounces everything downstream needed. Require several consecutive reverses; any
+            // interleaved forward transition resets the count. Genuine backward rotation produces a run
+            // of reverse codes and still trips it (just a few transitions later, which is harmless).
+            if (ui8_cadence_reverse_cnt < 255) ui8_cadence_reverse_cnt++;
+            if (ui8_cadence_reverse_cnt >= CADENCE_REVERSE_DEBOUNCE) { // believed real backward rotation
+                ui16_cadence_sensor_ticks = 0; // reset value used in ebike_app.c
+                i8_prev_cadence_index = -1;
+                ui8_pas_new_transition = 0x80; // used in mspider logic for torque sensor // to do
+            }
+            // else: ignore this isolated reverse - keep cadence and the torque buffer intact
         } else { // --- forward cadence (codes 0..3) ---
+            ui8_cadence_reverse_cnt = 0; // a forward transition clears the reverse debounce
             //ui16_debug_fw_cnt++;
             if (i8_prev_cadence_index < 0) {   // Premier front après arrêt → initialise seulement
                 i8_prev_cadence_index = (int8_t)ui8_cadence_idx_max;
