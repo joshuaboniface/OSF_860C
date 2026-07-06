@@ -493,6 +493,95 @@ static void ebike_control_motor(void) // is called every 25ms by ebike_app_contr
 	}
 	ui8_prev_adc_battery_current_target = ui8_adc_battery_current_target;
 
+	// LAUNCH BOOST FLOOR: the purpose of the boost is to get going quickly from a HARD
+	// STOP on the flat; once rolling it isn't wanted. A firm press from a near-stop ARMS a sustained
+	// battery-current floor: it holds the assist target UP through the noisy pedal signal during the
+	// first 1-2 crank rotations, then fades LINEARLY to 0 as speed builds -> the "quick boost to ~max,
+	// smooth taper to normal" curve. It is a feed-forward floor, deliberately INDEPENDENT of the
+	// instantaneous torque AND cadence, which is the whole point: ride-log analysis (ride10) proved the
+	// post-boost "V-notch" cutout is the assist target collapsing to 0 at a pedal dead-spot (torque
+	// drops to its resting baseline, ui16_adc_pedal_torque_delta -> 0), which disables the inverter and
+	// drops duty (and therefore current, since ibat = phase x duty) hard to 0 for ~0.3 s. The phase-cap
+	// (systick) already gives a smooth current RISE; this floor stops the COLLAPSE.
+	//
+	// THE OLD BUG (why prior boost-floor builds "did nothing"): disarm was (wheel==0 && cadence==0). At a
+	// launch the wheel is still 0 while the low-rpm PAS cadence dithers through 0, so the floor disarmed
+	// one tick after it armed -> the launch ran on raw torque-assist and collapsed at the first dead-spot.
+	// FIX: never disarm on a momentary cadence==0. Disarm only when the launch is genuinely over (up to
+	// speed) or after a DEBOUNCED true-stop (no pedal AND no wheel for 500 ms). And hold the floor through
+	// brief cadence==0 (dead-spot / PAS quadrature dither, up to PEDAL_GRACE) so the target can't collapse
+	// mid-boost; only a SUSTAINED no-pedal fades it out, so there is no ghost-pedalling power once you
+	// genuinely stop. Armed only at low speed + firm press + cranks-moving (pre-move-kick safe); ramps in
+	// over a few ticks (anti-lurch). Floor capped to ui8_adc_battery_current_max; phase-cap still governs
+	// delivery at low duty.
+	#define BOOST_FLOOR_ARM_SPEED_X10     30   // < 3.0 km/h to arm (a near-stop)
+	#define BOOST_FLOOR_FADE_SPEED_X10   150   // floor fades to 0 by 15.0 km/h
+	#define BOOST_FLOOR_ARM_TORQUE        30   // pedal-torque-delta firm-press threshold to arm
+	#define BOOST_FLOOR_RAMP_TICKS         4   // ramp the floor in over 4 * 25 ms = 100 ms after arming
+	#define BOOST_FLOOR_PEDAL_GRACE        6   // hold the floor through up to 6*25ms = 150 ms of cadence==0.
+	                                           //   Kept short so a genuine stop (sustained cadence==0) fades
+	                                           //   the floor out quickly = less motor over-run after you stop
+	                                           //   pedalling. A brief torque dead-spot keeps cadence>0, so it
+	                                           //   is bridged rather than triggering this fade.
+	#define BOOST_FLOOR_DISARM_TICKS      20   // 20*25ms = 500 ms of true-stop (no pedal + no wheel) re-arms
+	static uint8_t ui8_boost_floor_active = 0;
+	static uint8_t ui8_boost_floor_ramp = 0;
+	static uint8_t ui8_boost_floor_nopedal_cnt = 0;   // consecutive 25 ms ticks with cadence == 0
+	static uint8_t ui8_boost_floor_stop_cnt = 0;      // consecutive 25 ms ticks fully stopped (no pedal+no wheel)
+	// debounce counters (saturating)
+	if (ui8_pedal_cadence_RPM == 0) {
+		if (ui8_boost_floor_nopedal_cnt < 255) ui8_boost_floor_nopedal_cnt++;
+	} else {
+		ui8_boost_floor_nopedal_cnt = 0;
+	}
+	if ((ui16_wheel_speed_x10 == 0) && (ui8_pedal_cadence_RPM == 0)) {
+		if (ui8_boost_floor_stop_cnt < 255) ui8_boost_floor_stop_cnt++;
+	} else {
+		ui8_boost_floor_stop_cnt = 0;
+	}
+	// ARM: firm press, from a near-stop, with the cranks actually turning (pre-move-kick safe)
+	if (!ui8_boost_floor_active
+			&& (ui16_wheel_speed_x10 < BOOST_FLOOR_ARM_SPEED_X10)
+			&& (ui8_pedal_cadence_RPM > 0)
+			&& (ui16_adc_pedal_torque_delta > BOOST_FLOOR_ARM_TORQUE)) {
+		ui8_boost_floor_active = 1;
+		ui8_boost_floor_ramp = 0;
+	}
+	// DISARM (reset for the next launch) ONLY when the launch is genuinely over, NOT on a momentary
+	// cadence==0 at launch (the old bug). See the note above.
+	if ((ui16_wheel_speed_x10 >= BOOST_FLOOR_FADE_SPEED_X10)
+			|| (ui8_boost_floor_stop_cnt >= BOOST_FLOOR_DISARM_TICKS)) {
+		ui8_boost_floor_active = 0;
+	}
+	// APPLY: hold the floor through brief cadence==0 (< grace); a sustained no-pedal fades it out
+	// (re-ramps if pedalling resumes, so no lurch).
+	if (ui8_boost_floor_active && (ui8_boost_floor_nopedal_cnt < BOOST_FLOOR_PEDAL_GRACE)) {
+		if (ui8_boost_floor_ramp < BOOST_FLOOR_RAMP_TICKS) ui8_boost_floor_ramp++;
+		uint32_t ui32_floor = ((uint32_t)ui8_adc_battery_current_max
+				* (BOOST_FLOOR_FADE_SPEED_X10 - ui16_wheel_speed_x10)) / BOOST_FLOOR_FADE_SPEED_X10; // speed fade
+		ui32_floor = (ui32_floor * ui8_boost_floor_ramp) / BOOST_FLOOR_RAMP_TICKS;                  // arming ramp-in
+		if (ui8_adc_battery_current_target < ui32_floor) {
+			ui8_adc_battery_current_target = (uint8_t)ui32_floor;
+		}
+	} else {
+		ui8_boost_floor_ramp = 0;   // not applying (pre-arm / stopped pedalling): re-ramp on resume (anti-lurch)
+	}
+
+	// OPEN THE DUTY CEILING WHEN HOLDING A CURRENT TARGET. The assist functions
+	// (apply_power_assist / apply_torque_assist) set ui8_duty_cycle_target to 0 whenever the INSTANTANEOUS
+	// current target is 0 - e.g. a pedal dead-spot where torque_delta falls to its resting baseline. The
+	// dead-spot bridge and boost floor above restore the CURRENT target, but a duty-cycle ceiling of 0
+	// makes systick ramp duty (hence current, ibat = phase x duty) straight to 0 regardless of the current
+	// target (systick.c update_duty_cycle ~722), after which the inverter disables (erps0 + target0 +
+	// duty0) = the hard launch cutout. THIS is why both the bridge and the floor "did basically nothing"
+	// at the dead-spots: they raised the current target into a duty ceiling that was pinned shut. So:
+	// whenever we are holding a current target, also open the duty ceiling so the regulator can deliver it.
+	// The current ceiling + phase cap still bound the actual delivery, and a genuine release (target back
+	// to 0) still closes it, so this cannot produce unwanted power.
+	if ((ui8_adc_battery_current_target > 0) && (ui8_duty_cycle_target == 0)) {
+		ui8_duty_cycle_target = ui8_pwm_duty_cycle_max;
+	}
+
 	// used only in 860C version
 	// check if motor init delay has to be done (from v.1.1.0)
 	switch (ui8_m_motor_init_state)	{
