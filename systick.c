@@ -600,6 +600,32 @@ uint16_t ui16_fw_hall_counter_offset = 0;
 
 uint32_t debug_duty_limit_active_cnt = 0;
 
+// ---------------------------------------------------------------------------------------------------
+// Current regulation — asymmetric hold-band + proactive phase-current cap.
+//
+// mstrens' port regulated the duty as a per-tick BANG-BANG relay directly against the battery-current
+// target. With the in-loop ~3.4 ms averaged current that relay limit-cycles at ~10 Hz (flutter), worst
+// when pinned at the current/power limit. Fix = an asymmetric hold-band around the current target plus a
+// proactive phase-current cap. We deliberately KEEP mstrens' 64-sample current average and the 1 kHz loop
+// (the average suppresses real ~6x-flux BEMF current ripple; the 1 kHz rate is forced by the M0 CPU
+// budget). All his protections (phase-peak, Idc-fast, RMS, duty_limit) are untouched.
+// (A TSDZ2-style slew-rate-limited current ceiling was tried here too, then removed: the duty-cycle ramp
+// is the slower binding constraint in every regime, so the ceiling slew had no measurable effect.)
+
+// Asymmetric hold-band around the current target (ADC battery-current steps, ~0.16 A/step). UP small = fast
+// kick-in; DOWN larger = tolerate current above the target before clawing duty down, which breaks
+// steady-state hunting. UP=0,DOWN=0 = no hold band.
+#define CURRENT_REGULATION_DEADBAND_UP    3
+#define CURRENT_REGULATION_DEADBAND_DOWN  10
+
+// Motor PHASE-current limiting. The phase current is ESTIMATED as battery/duty, so the
+// original approach of limiting it by clawing the DUTY down was a positive-feedback trap: less duty ->
+// bigger estimate -> claw more -> collapse to 0 (the launch V-notch). The stable solution is in
+// update_duty_cycle(): cap the current target at phase_max*duty (the battery current that holds the
+// phase estimate AT its limit for the present duty) instead of clawing the duty. See the comment there.
+// The HARD over-current faults (fault_phase_current_peak, fault_idc_fast) stay immediate in the 19 kHz
+// ISR as the real instantaneous safety.
+
 void update_duty_cycle(void){
     // update ramp steps when they change
     if (ui8_controller_duty_cycle_ramp_up_inverse_step_prev != ui8_controller_duty_cycle_ramp_up_inverse_step) {
@@ -623,11 +649,37 @@ void update_duty_cycle(void){
         ui16_g_duty_cycle -= ui16_g_duty_cycle >> 3 ; // reduce duty_cycle by 1/8
         debug_duty_limit_active_cnt++;
         return;
-    }     
-    
+    }
+
+    // PROACTIVE PHASE-CURRENT CAP. Replaces the reactive phase claw, which limited motor
+    // phase current by clawing the DUTY down -- but phase is ESTIMATED as battery/duty, so trimming duty
+    // INFLATES the estimate, which claws more: a positive-feedback collapse straight to 0 (the launch
+    // "V-notch", felt as a jarring cut-out). Instead cap the battery-current CEILING at the value that
+    // holds the phase estimate at its limit for the present duty: phase = battery/duty  =>
+    // battery_cap = phase_max * duty. That is STABLE negative feedback (less ceiling -> less current ->
+    // less phase), so the motor RIDES the phase limit smoothly (full torque, power rising as the duty /
+    // speed builds) instead of slamming into it and bouncing to zero. The hard phase-peak / Idc-fast
+    // faults (motor.c, 19 kHz ISR) remain the real instantaneous over-current safety, untouched.
+    // Floor the duty used for the cap at PWM_DUTY_CYCLE_STARTUP: at duty 0 the cap would be 0, which
+    // would block the ramp-up forever and the motor could never start. The motor only ever runs at
+    // >= startup duty, so flooring it here is exact, not a fudge, and it keeps "full torque from a
+    // standstill" (cap at startup duty already corresponds to phase = phase_max).
+    uint16_t ui16_cap_duty = (uint16_t)(ui16_g_duty_cycle >> 8);
+    if (ui16_cap_duty < PWM_DUTY_CYCLE_STARTUP) ui16_cap_duty = PWM_DUTY_CYCLE_STARTUP;
+    uint16_t ui16_phase_battery_cap = ((uint32_t)ui16_adc_motor_phase_current_max
+            * ui16_cap_duty) / ui8_pwm_duty_cycle_max;
+    uint16_t ui16_effective_ceiling = ui8_controller_adc_battery_current_target;
+    if (ui16_effective_ceiling > ui16_phase_battery_cap) ui16_effective_ceiling = ui16_phase_battery_cap;
+
+    // hold-band-aware comparison against the (phase-capped) current target. Ramp down only when current
+    // is above ceiling + DOWN band; ramp up only when below ceiling - UP band; hold in between.
+    bool b_current_over_target  = ((uint16_t)ui8_adc_battery_current_filtered
+            > ui16_effective_ceiling + CURRENT_REGULATION_DEADBAND_DOWN);
+    bool b_current_under_target = ((uint16_t)ui8_adc_battery_current_filtered + CURRENT_REGULATION_DEADBAND_UP
+            < ui16_effective_ceiling);
+
     if ((ui8_controller_duty_cycle_target < (ui16_g_duty_cycle >> 8))                     // requested duty cycle is lower than actual
-            || (ui8_controller_adc_battery_current_target < ui8_adc_battery_current_filtered)  // requested current is lower than actual
-            || (ui16_adc_motor_phase_current >  ui16_adc_motor_phase_current_max)               // motor phase is to high
+            || (b_current_over_target)                                                    // measured current above (phase-capped) ceiling + deadband
     //      || (ui16_hall_counter_total < (HALL_COUNTER_FREQ / MOTOR_OVER_SPEED_ERPS))        // Erps is to high
             || (ui16_adc_voltage < ui16_adc_voltage_cut_off)                                  // voltage is to low
             || (ui8_brake_state)
@@ -648,7 +700,7 @@ void update_duty_cycle(void){
         // }
     } else if(t_ramp_up_delay == 0) { // ramp up but only if not delayed due to a security check
         if ((ui8_controller_duty_cycle_target > (ui16_g_duty_cycle >> 8))                     // requested duty cycle is higher than actual
-                && (ui8_controller_adc_battery_current_target > ui8_adc_battery_current_filtered)) { //Requested current is higher than actual
+                && (b_current_under_target)) {     // measured current below the (phase-capped) ceiling - deadband
             uint32_t temp_duty = ui16_g_duty_cycle + ui16_controller_duty_cycle_ramp_up_step;
             // increment duty cycle
             if (temp_duty < (PWM_DUTY_CYCLE_STARTUP << 8)) {
