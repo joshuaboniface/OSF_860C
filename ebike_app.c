@@ -1673,6 +1673,7 @@ void new_torque_sample() {
 
 //( (USE_SPIDER_LOGIC_FOR_TORQUE > 0 (so 1, 2, 3)
 #define TORQUE_SENSOR_ADC_REMAP_NORM_DIFF_MAX 100 // max value is 160
+#define AUTO_OFFSET_DEADBAND 12  // counts above the auto-measured resting ADC before torque registers (deadband)
 static void get_pedal_torque(void) {
 	if (toffset_cycle_counter < TOFFSET_CYCLES) {  // less than 3 sec
 		ui16_adc_pedal_torque_offset_init = filter(ui16_adc_torque_filtered, ui16_adc_pedal_torque_offset_init , 4) ; // get filtered torque captured in motor.c irq1
@@ -1690,8 +1691,13 @@ static void get_pedal_torque(void) {
 	} else { // after 3 sec
 		ui16_adc_pedal_torque = ui16_adc_torque_filtered; // ui16_adc_torque_filtered is the value calculated in irq
 	}
-	ui16_adc_pedal_torque_offset = ui16_adc_pedal_torque_offset_set ; // this value is received from the config (in 860C)
-	ui16_adc_pedal_torque_delta = 0; // this is the final value to retun 
+	// AUTO-OFFSET: the 860C display caps the torque-offset config at 300, but a worn/high
+	// sensor can rest well above that (our faulty unit reads ~380). Use the boot-measured resting ADC
+	// (offset_init — filtered feet-off during the first ~3 s, frozen after) + a small deadband as the zero
+	// point, instead of the display-capped config value. Tracks the true sensor zero, bypasses the cap.
+	// REQUIRES booting with no pedal pressure. Was: = ui16_adc_pedal_torque_offset_set (the 860C config).
+	ui16_adc_pedal_torque_offset = ui16_adc_pedal_torque_offset_init + AUTO_OFFSET_DEADBAND ;
+	ui16_adc_pedal_torque_delta = 0; // this is the final value to retun
 	uint16_t ui16_TorqueDeltaADC_norm = 0;
 	uint16_t ui16_adc_torque = ui16_adc_torque_filtered; // save the value being calculated in motor.c because it can change in irq
 	if ( ui16_adc_torque > ui16_adc_pedal_torque_offset) {
@@ -2039,9 +2045,9 @@ static void check_system(void)
 	}
     // check torque sensor
     if (ui8_riding_torque_mode) {
-		if ((ui16_adc_pedal_torque_offset > 300)
+		if ((ui16_adc_pedal_torque_offset > 500)   // was 300; raised for the auto-offset zero (can sit ~390)
 		  ||(ui16_adc_pedal_torque_offset < 10)
-		  ||(ui16_adc_pedal_torque > 700)
+		  ||(ui16_adc_pedal_torque > 900)          // was 700; raised by ~the offset shift so hard pedaling doesn't false-trip E02
 		  ||(ui8_adc_pedal_torque_offset_error)) {
 			// set torque sensor error code
 			ui8_m_system_state |= ERROR_TORQUE_SENSOR;
