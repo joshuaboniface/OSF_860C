@@ -605,9 +605,22 @@ static void ebike_control_motor(void) // is called every 25ms by ebike_app_contr
 	// normal part of riding, and holding assist off for ~650 ms every time the rider indicates is more
 	// annoying than the occasional shift that misses the window and re-engages hard. Fail toward letting
 	// a shift through, not toward gagging the motor after a tap.
-	#define SHIFT_ASSERT_MAX_TICKS   9   // 9*25 = 225 ms; a longer assert is a brake lever, not a shift
-	#define SHIFT_HOLD_TICKS         6   // 6*25 = 150 ms held at zero after release (finish the shift)
-	#define SHIFT_RAMP_TICKS        12   // 12*25 = 300 ms linear return to full assist
+	// The window is budgeted from the START of the assert, not from its release, so the rider feels the
+	// SAME ~650 ms of interrupted drive whatever the sensor did. Measured widths vary a lot under load
+	// (98-258 ms over one ride), and a fixed post-release hold turns that variation straight into
+	// variation in how long the motor is out: 548 ms for a short pulse, 708 ms for a long one. Budgeting
+	// the total and spending what the assert already consumed makes the feel constant and, usefully,
+	// makes a LONGER assert cost nothing extra - which is why the classification threshold can be
+	// generous (275 ms) without lengthening anything. That closes the last gap: 4 of 53 shifts on the
+	// test ride ran 226-258 ms, missed the old 225 ms threshold entirely, and re-engaged hard.
+	// The RAMP is fixed at 300 ms - it is the part the rider feels as the motor coming back, and it was
+	// ride-confirmed at that length, so it should not shrink just because a pulse ran long. The assert is
+	// spent out of the HOLD instead: hold = 350 ms - assert. At the 275 ms classification limit that
+	// still leaves 75 ms of dead time before the ramp starts, which is enough of a gap. A ~207 ms pulse
+	// therefore reproduces exactly the ride-confirmed 150 ms hold + 300 ms ramp.
+	#define SHIFT_ASSERT_MAX_TICKS   11  // 11*25 = 275 ms; a longer assert is a brake lever, not a shift
+	#define SHIFT_HOLD_BUDGET_TICKS  14  // 14*25 = 350 ms of hold budget, minus whatever the assert used
+	#define SHIFT_RAMP_TICKS         12  // 12*25 = 300 ms; FIXED - the return itself never varies
 	static uint8_t ui8_brake_state_prev = 0;
 	static uint8_t ui8_brake_assert_ticks = 0;
 	static uint8_t ui8_shift_reengage_ticks = 0;   // counts DOWN through the hold, then the ramp
@@ -616,7 +629,10 @@ static void ebike_control_motor(void) // is called every 25ms by ebike_app_contr
 	}
 	else if (ui8_brake_state_prev) {               // falling edge: classify what just released
 		if (ui8_brake_assert_ticks <= SHIFT_ASSERT_MAX_TICKS) {
-			ui8_shift_reengage_ticks = SHIFT_HOLD_TICKS + SHIFT_RAMP_TICKS;   // a shift: arm (or re-arm)
+			// Spend what the assert already used out of the HOLD budget only; the ramp is untouched.
+			uint8_t ui8_hold = (ui8_brake_assert_ticks < SHIFT_HOLD_BUDGET_TICKS)
+					? (uint8_t)(SHIFT_HOLD_BUDGET_TICKS - ui8_brake_assert_ticks) : 0U;
+			ui8_shift_reengage_ticks = ui8_hold + SHIFT_RAMP_TICKS;   // a shift: arm (or re-arm)
 		}
 		ui8_brake_assert_ticks = 0;
 	}
@@ -626,7 +642,7 @@ static void ebike_control_motor(void) // is called every 25ms by ebike_app_contr
 		if (ui8_shift_reengage_ticks >= SHIFT_RAMP_TICKS) {
 			ui8_adc_battery_current_target = 0;                               // hold: nothing on the chain
 		}
-		else {                                                                // ramp: 1/16 .. 16/16
+		else {                                                                // ramp: 1/12 .. 12/12
 			ui8_adc_battery_current_target = (uint8_t)(((uint32_t)ui8_adc_battery_current_target
 					* (SHIFT_RAMP_TICKS - ui8_shift_reengage_ticks)) / SHIFT_RAMP_TICKS);
 		}
