@@ -567,6 +567,62 @@ static void ebike_control_motor(void) // is called every 25ms by ebike_app_contr
 		ui8_boost_floor_ramp = 0;   // not applying (pre-arm / stopped pedalling): re-ramp on resume (anti-lurch)
 	}
 
+	// SHIFT RE-ENGAGE HOLD. The TSDZ8's 3-pin gear-sensor port and both brake levers land on the SAME
+	// controller input, so a gear shift and a brake are one bit (ui8_brake_state) as far as this firmware
+	// is concerned. Only the assert DURATION separates them, and it separates them cleanly: measured on
+	// this bike through the ESP tap (fw v46, which decodes tx_buffer[8] bit 0 and times each assert), the
+	// shift sensor emits a fixed ~200 ms one-shot (7 of 9 shifts at 206-207 ms, one at 259), while brake
+	// squeezes ran 259-569 ms. (Everything quantizes to the ~52 ms frame period.)
+	//
+	// ~200 ms is not long enough to shift under load. Assist is back within ~280 ms of release, because
+	// the re-engage ramp step is picked from wheel speed and cadence (see the ramp map above) taking
+	// whichever is FASTER, and while shifting you are by definition pedalling, so cadence alone selects
+	// the minimum inverse step, the fastest ramp in the firmware. Worse at low speed, where the launch
+	// boost floor is also actively trying to restore current. The chain is therefore reloaded before the
+	// derailleur has finished moving: the drivetrain wear this whole path exists to prevent.
+	//
+	// So, on the falling edge of a SHORT assert: hold the assist target at zero for SHIFT_HOLD_TICKS,
+	// then return it linearly over SHIFT_RAMP_TICKS. ~200 + 250 + 400 = ~850 ms from the shift starting
+	// to full assist, of which ~450 ms is genuinely dead. Running AFTER the dead-spot bridge and the
+	// boost floor, and BEFORE the duty-ceiling open below, means it also clamps those two: a zero target
+	// keeps the ceiling shut, exactly as a brake does.
+	//
+	// A LONG assert is a real brake lever and is left completely alone: today's behaviour, unchanged. A
+	// double-trigger (one of the nine measured pulses was one) simply re-arms the window, which is the
+	// wanted behaviour.
+	//
+	// Threshold deliberately TIGHT (225 ms, barely above the measured ~207 ms one-shot) rather than
+	// generous. The turn-signal gesture is a double-TAP of a brake lever, so brief lever asserts are a
+	// normal part of riding, and holding assist off for ~850 ms every time the rider indicates is far more
+	// annoying than the occasional shift that misses the window and re-engages hard. Fail toward letting
+	// a shift through, not toward gagging the motor after a tap.
+	#define SHIFT_ASSERT_MAX_TICKS   9   // 9*25 = 225 ms; a longer assert is a brake lever, not a shift
+	#define SHIFT_HOLD_TICKS        10   // 10*25 = 250 ms held at zero after release (finish the shift)
+	#define SHIFT_RAMP_TICKS        16   // 16*25 = 400 ms linear return to full assist
+	static uint8_t ui8_brake_state_prev = 0;
+	static uint8_t ui8_brake_assert_ticks = 0;
+	static uint8_t ui8_shift_reengage_ticks = 0;   // counts DOWN through the hold, then the ramp
+	if (ui8_brake_state) {
+		if (ui8_brake_assert_ticks < 255) { ui8_brake_assert_ticks++; }
+	}
+	else if (ui8_brake_state_prev) {               // falling edge: classify what just released
+		if (ui8_brake_assert_ticks <= SHIFT_ASSERT_MAX_TICKS) {
+			ui8_shift_reengage_ticks = SHIFT_HOLD_TICKS + SHIFT_RAMP_TICKS;   // a shift: arm (or re-arm)
+		}
+		ui8_brake_assert_ticks = 0;
+	}
+	ui8_brake_state_prev = ui8_brake_state;
+	if (ui8_shift_reengage_ticks) {
+		ui8_shift_reengage_ticks--;
+		if (ui8_shift_reengage_ticks >= SHIFT_RAMP_TICKS) {
+			ui8_adc_battery_current_target = 0;                               // hold: nothing on the chain
+		}
+		else {                                                                // ramp: 1/16 .. 16/16
+			ui8_adc_battery_current_target = (uint8_t)(((uint32_t)ui8_adc_battery_current_target
+					* (SHIFT_RAMP_TICKS - ui8_shift_reengage_ticks)) / SHIFT_RAMP_TICKS);
+		}
+	}
+
 	// OPEN THE DUTY CEILING WHEN HOLDING A CURRENT TARGET. The assist functions
 	// (apply_power_assist / apply_torque_assist) set ui8_duty_cycle_target to 0 whenever the INSTANTANEOUS
 	// current target is 0 - e.g. a pedal dead-spot where torque_delta falls to its resting baseline. The
