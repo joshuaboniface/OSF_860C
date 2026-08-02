@@ -582,23 +582,32 @@ static void ebike_control_motor(void) // is called every 25ms by ebike_app_contr
 	// derailleur has finished moving: the drivetrain wear this whole path exists to prevent.
 	//
 	// So, on the falling edge of a SHORT assert: hold the assist target at zero for SHIFT_HOLD_TICKS,
-	// then return it linearly over SHIFT_RAMP_TICKS. ~200 + 250 + 400 = ~850 ms from the shift starting
-	// to full assist, of which ~450 ms is genuinely dead. Running AFTER the dead-spot bridge and the
+	// then return it linearly over SHIFT_RAMP_TICKS. ~200 + 150 + 300 = ~650 ms from the shift starting
+	// to full assist, of which ~350 ms is genuinely dead. Was 250 + 400 (~850 ms) on the first ride-tested
+	// build: confirmed working, but more time off the power than the rider wants - and more than the shift
+	// needs, since that ride's logged pulses put real shifts at 103-207 ms UNDER LOAD, shorter and more
+	// variable than the 206-259 ms measured stationary. Running AFTER the dead-spot bridge and the
 	// boost floor, and BEFORE the duty-ceiling open below, means it also clamps those two: a zero target
 	// keeps the ceiling shut, exactly as a brake does.
 	//
 	// A LONG assert is a real brake lever and is left completely alone: today's behaviour, unchanged. A
-	// double-trigger (one of the nine measured pulses was one) simply re-arms the window, which is the
-	// wanted behaviour.
+	// double-trigger simply re-arms the window, which is the wanted behaviour.
+	//
+	// KNOWN AND ACCEPTED: width cannot separate a shift from a turn-signal tap on this bike. A ride's
+	// worth of pulses, labelled by the monitor (which reads each lever independently, unlike this
+	// controller), put six shifts and six lever taps all at 206-207 ms - the distributions coincide
+	// rather than merely overlap, so roughly half of all turn-signal taps also trigger this hold. No
+	// threshold fixes that; only a second input, or a gesture rule, could. Shortening the hold is what
+	// makes the false trigger tolerable.
 	//
 	// Threshold deliberately TIGHT (225 ms, barely above the measured ~207 ms one-shot) rather than
 	// generous. The turn-signal gesture is a double-TAP of a brake lever, so brief lever asserts are a
-	// normal part of riding, and holding assist off for ~850 ms every time the rider indicates is far more
+	// normal part of riding, and holding assist off for ~650 ms every time the rider indicates is more
 	// annoying than the occasional shift that misses the window and re-engages hard. Fail toward letting
 	// a shift through, not toward gagging the motor after a tap.
 	#define SHIFT_ASSERT_MAX_TICKS   9   // 9*25 = 225 ms; a longer assert is a brake lever, not a shift
-	#define SHIFT_HOLD_TICKS        10   // 10*25 = 250 ms held at zero after release (finish the shift)
-	#define SHIFT_RAMP_TICKS        16   // 16*25 = 400 ms linear return to full assist
+	#define SHIFT_HOLD_TICKS         6   // 6*25 = 150 ms held at zero after release (finish the shift)
+	#define SHIFT_RAMP_TICKS        12   // 12*25 = 300 ms linear return to full assist
 	static uint8_t ui8_brake_state_prev = 0;
 	static uint8_t ui8_brake_assert_ticks = 0;
 	static uint8_t ui8_shift_reengage_ticks = 0;   // counts DOWN through the hold, then the ramp
