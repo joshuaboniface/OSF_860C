@@ -628,16 +628,26 @@ static void ebike_control_motor(void) // is called every 25ms by ebike_app_contr
 		if (ui8_brake_assert_ticks < 255) { ui8_brake_assert_ticks++; }
 	}
 	else if (ui8_brake_state_prev) {               // falling edge: classify what just released
-		if (ui8_brake_assert_ticks <= SHIFT_ASSERT_MAX_TICKS) {
-			// Spend what the assert already used out of the HOLD budget only; the ramp is untouched.
-			uint8_t ui8_hold = (ui8_brake_assert_ticks < SHIFT_HOLD_BUDGET_TICKS)
-					? (uint8_t)(SHIFT_HOLD_BUDGET_TICKS - ui8_brake_assert_ticks) : 0U;
-			ui8_shift_reengage_ticks = ui8_hold + SHIFT_RAMP_TICKS;   // a shift: arm (or re-arm)
+		// Spend what the assert already used out of the HOLD budget only; the ramp is untouched.
+		uint8_t ui8_hold = (ui8_brake_assert_ticks < SHIFT_HOLD_BUDGET_TICKS)
+				? (uint8_t)(SHIFT_HOLD_BUDGET_TICKS - ui8_brake_assert_ticks) : 0U;
+		// EVERY cut restarts the window. A shift arms it outright; a LONGER assert only re-arms one that
+		// was already pending - i.e. something interrupted a shift that had not finished recovering. That
+		// second case is the one that bit: without it, the interrupting assert consumed the window (see
+		// the freeze below) and power came back instantly at full, which at L5 is violent. Ordinary
+		// braking with nothing pending still restores normally, exactly as before this patch existed.
+		if ((ui8_brake_assert_ticks <= SHIFT_ASSERT_MAX_TICKS) || (ui8_shift_reengage_ticks > 0U)) {
+			ui8_shift_reengage_ticks = ui8_hold + SHIFT_RAMP_TICKS;
 		}
 		ui8_brake_assert_ticks = 0;
 	}
 	ui8_brake_state_prev = ui8_brake_state;
-	if (ui8_shift_reengage_ticks) {
+	// FROZEN WHILE THE LINE IS ASSERTED. The window measures time-with-power-off AFTER a release; time
+	// spent asserted is already power-off for a different reason (the brake safety path zeroes the target
+	// regardless), so counting it down spends the recovery invisibly. Double-shifts make this the common
+	// case, not an edge one: on the confirming ride 24 of 56 pulse-bearing sample windows contained two
+	// or more asserts, up to four in five seconds.
+	if (ui8_shift_reengage_ticks && !ui8_brake_state) {
 		ui8_shift_reengage_ticks--;
 		if (ui8_shift_reengage_ticks >= SHIFT_RAMP_TICKS) {
 			ui8_adc_battery_current_target = 0;                               // hold: nothing on the chain
