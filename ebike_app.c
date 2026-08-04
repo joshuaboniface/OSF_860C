@@ -621,6 +621,7 @@ static void ebike_control_motor(void) // is called every 25ms by ebike_app_contr
 	#define SHIFT_ASSERT_MAX_TICKS   11  // 11*25 = 275 ms; a longer assert is a brake lever, not a shift
 	#define SHIFT_HOLD_BUDGET_TICKS  14  // 14*25 = 350 ms of hold budget, minus whatever the assert used
 	#define SHIFT_RAMP_TICKS         12  // 12*25 = 300 ms; FIXED - the return itself never varies
+	#define SHIFT_MIN_HOLD_TICKS      6  // 6*25 = 150 ms; a FLOOR under the hold - see below
 	static uint8_t ui8_brake_state_prev = 0;
 	static uint8_t ui8_brake_assert_ticks = 0;
 	static uint8_t ui8_shift_reengage_ticks = 0;   // counts DOWN through the hold, then the ramp
@@ -629,8 +630,25 @@ static void ebike_control_motor(void) // is called every 25ms by ebike_app_contr
 	}
 	else if (ui8_brake_state_prev) {               // falling edge: classify what just released
 		// Spend what the assert already used out of the HOLD budget only; the ramp is untouched.
+		//
+		// FLOORED AT 150 ms, because the budget's assumption breaks down at the top end. Subtracting the
+		// assert treats its length as shifting already DONE — true for one gear, where the cable moves
+		// and the derailleur follows it. A multi-gear sweep is the opposite: a longer cable movement
+		// means more shifting still TO COME, so the un-floored formula handed the biggest shifts the
+		// shortest dead window. A 310 ms assert got 40 ms, which is no window at all.
+		//
+		// THE COST, stated plainly: this controller has ONE brake input, with the levers and the gear
+		// sensor diode-ORed onto it, so it cannot tell a long shift from a brake. A brake that lands
+		// mid-recovery therefore also gains 150 ms of dead motor after release, where it previously got
+		// none. That is accepted deliberately — 150 ms is at the edge of perceptible, and it buys a
+		// real window for the multi-gear shifts that otherwise re-engage hard.
+		//
+		// It changes nothing below ~200 ms: a typical 207 ms shift was already getting 143 ms, and
+		// anything shorter gets more than the floor anyway. A brake with NO window pending still arms
+		// nothing at all, so ordinary braking — the overwhelming majority — is untouched.
 		uint8_t ui8_hold = (ui8_brake_assert_ticks < SHIFT_HOLD_BUDGET_TICKS)
 				? (uint8_t)(SHIFT_HOLD_BUDGET_TICKS - ui8_brake_assert_ticks) : 0U;
+		if (ui8_hold < SHIFT_MIN_HOLD_TICKS) { ui8_hold = SHIFT_MIN_HOLD_TICKS; }
 		// EVERY cut restarts the window. A shift arms it outright; a LONGER assert only re-arms one that
 		// was already pending - i.e. something interrupted a shift that had not finished recovering. That
 		// second case is the one that bit: without it, the interrupting assert consumed the window (see
